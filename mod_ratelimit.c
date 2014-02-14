@@ -35,12 +35,15 @@ typedef struct rl_ctx_t
 {
     int speed;
     int chunk_size;
+    int collected_bytes;
     rl_state_e state;
     apr_bucket_brigade *tmpbb;
+    // tail of the input brigade
     apr_bucket_brigade *holdingbb;
+    apr_bucket_brigade *collectorbb;
 } rl_ctx_t;
 
-#if 0
+#if 1
 static void brigade_dump(request_rec *r, apr_bucket_brigade *bb)
 {
     apr_bucket *e;
@@ -64,6 +67,8 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *input_bb)
     int do_sleep = 0;
     apr_bucket_alloc_t *ba = f->r->connection->bucket_alloc;
     apr_bucket_brigade *bb = input_bb;
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "rl: start");
+    brigade_dump(f->r, bb);
 
     if (f->c->aborted) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "rl: conn aborted");
@@ -72,7 +77,7 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *input_bb)
     }
 
     if (ctx == NULL) {
-
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "rl: init context");
         const char *rl = NULL;
         int ratelimit;
 
@@ -85,10 +90,13 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *input_bb)
         rl = apr_table_get(f->r->subprocess_env, "rate-limit");
 
         if (rl == NULL) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "rl: can not find rate-limit, removing filter");
             ap_remove_output_filter(f);
             return ap_pass_brigade(f->next, bb);
         }
-        
+
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "rl: found rate-limit %s", rl);
+
         /* rl is in kilo bytes / second  */
         ratelimit = atoi(rl) * 1024;
         if (ratelimit <= 0) {
@@ -106,9 +114,28 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *input_bb)
         /* calculate how many bytes / interval we want to send */
         /* speed is bytes / second, so, how many  (speed / 1000 % interval) */
         ctx->chunk_size = (ctx->speed / (1000 / RATE_INTERVAL_MS));
+        ctx->collected_bytes = 0;
         ctx->tmpbb = apr_brigade_create(f->r->pool, ba);
         ctx->holdingbb = apr_brigade_create(f->r->pool, ba);
+        ctx->collectorbb = apr_brigade_create(f->r->pool, ba);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "rl: chunk size %d", ctx->chunk_size);
     }
+
+    apr_off_t len = 0;
+    apr_brigade_length(input_bb, 1, &len);
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+                      "rl: input_bb len %ld", len);
+    APR_BRIGADE_CONCAT(ctx->collectorbb, input_bb);
+    ctx->collected_bytes += len;
+    int is_last_brigade = APR_BUCKET_IS_EOS(APR_BRIGADE_LAST(ctx->collectorbb));
+
+    // mod proxy returns small brigades under 8000 bytes,
+    // so we need to collect them
+    if (ctx->collected_bytes < ctx->chunk_size && !is_last_brigade) {
+        return rv;
+    }
+
+    bb = ctx->collectorbb;
 
     while (ctx->state != RATE_ERROR &&
            (!APR_BRIGADE_EMPTY(bb) || !APR_BRIGADE_EMPTY(ctx->holdingbb))) {
@@ -155,19 +182,21 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *input_bb)
             for (e = APR_BRIGADE_FIRST(bb);
                  e != APR_BRIGADE_SENTINEL(bb); e = APR_BUCKET_NEXT(e)) {
                 if (AP_RL_BUCKET_IS_START(e)) {
-                    apr_bucket *f;
-                    f = APR_RING_LAST(&bb->list);
-                    APR_RING_UNSPLICE(e, f, link);
-                    APR_RING_SPLICE_TAIL(&ctx->holdingbb->list, e, f,
+                    apr_bucket *f1;
+                    f1 = APR_RING_LAST(&bb->list);
+                    APR_RING_UNSPLICE(e, f1, link);
+                    APR_RING_SPLICE_TAIL(&ctx->holdingbb->list, e, f1,
                                          apr_bucket, link);
                     ctx->state = RATE_FULLSPEED;
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+                              "rl: going full speed");
+                    brigade_dump(f->r, ctx->holdingbb);
                     break;
                 }
             }
 
             while (!APR_BRIGADE_EMPTY(bb)) {
                 apr_bucket *stop_point;
-                apr_off_t len = 0;
 
                 if (f->c->aborted) {
                     apr_brigade_cleanup(bb);
@@ -176,13 +205,10 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *input_bb)
                 }
 
                 if (do_sleep) {
-                    apr_sleep(RATE_INTERVAL_MS * 1000);
                 }
                 else {
                     do_sleep = 1;
                 }
-
-                apr_brigade_length(bb, 1, &len);
 
                 rv = apr_brigade_partition(bb, ctx->chunk_size, &stop_point);
                 if (rv != APR_SUCCESS && rv != APR_INCOMPLETE) {
@@ -204,23 +230,41 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *input_bb)
                     APR_BRIGADE_CONCAT(ctx->tmpbb, bb);
                 }
 
+                apr_brigade_length(ctx->tmpbb, 1, &len);
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+                                  "rl: tmpbb len %d", len);
+
                 fb = apr_bucket_flush_create(ba);
 
                 APR_BRIGADE_INSERT_TAIL(ctx->tmpbb, fb);
 
-#if 0
+#if 1
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "tmpbb");
                 brigade_dump(f->r, ctx->tmpbb);
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r, "bb");
                 brigade_dump(f->r, bb);
 #endif
 
                 rv = ap_pass_brigade(f->next, ctx->tmpbb);
                 apr_brigade_cleanup(ctx->tmpbb);
+                ctx->collected_bytes -= len;
 
                 if (rv != APR_SUCCESS) {
                     ctx->state = RATE_ERROR;
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
                                   "rl: brigade pass failed.");
                     break;
+                }
+
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+                                  "rl: remaining len %d", ctx->collected_bytes);
+
+                if (ctx->collected_bytes > 0) {
+                    apr_sleep(RATE_INTERVAL_MS * 1000);
+                }
+
+                if (ctx->collected_bytes < ctx->chunk_size && !is_last_brigade) {
+                    return rv;
                 }
             }
         }
